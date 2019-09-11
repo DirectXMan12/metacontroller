@@ -22,10 +22,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 
 	"metacontroller.app/apis/metacontroller/v1alpha1"
 	"metacontroller.app/controller/common"
-	dynamicdiscovery "metacontroller.app/dynamic/discovery"
 )
 
 type decoratorSelector struct {
@@ -33,20 +33,19 @@ type decoratorSelector struct {
 	annotationSelectors map[string]labels.Selector
 }
 
-func newDecoratorSelector(resources *dynamicdiscovery.ResourceMap, dc *v1alpha1.DecoratorController) (*decoratorSelector, error) {
+func newDecoratorSelector(resources apimeta.RESTMapper, dc *v1alpha1.DecoratorController) (*decoratorSelector, error) {
 	ds := &decoratorSelector{
 		labelSelectors:      make(map[string]labels.Selector),
 		annotationSelectors: make(map[string]labels.Selector),
 	}
-	var err error
 
 	for _, parent := range dc.Spec.Resources {
 		// Keep the map by Group and Kind. Ignore Version.
-		resource := resources.Get(parent.APIVersion, parent.Resource)
-		if resource == nil {
-			return nil, fmt.Errorf("can't find resource %q in apiVersion %q", parent.Resource, parent.APIVersion)
+		gvk, err := resourceToGVK(parent.APIVersion, parent.Resource, resources)
+		if err != nil {
+			return nil, fmt.Errorf("can't find resource %q in apiVersion %q: %v", parent.Resource, parent.APIVersion, err)
 		}
-		key := selectorMapKey(resource.Group, resource.Kind)
+		key := selectorMapKey(gvk.Group, gvk.Kind)
 
 		// Convert the label selector to the internal form.
 		if parent.LabelSelector != nil {

@@ -19,18 +19,19 @@ package common
 import (
 	"fmt"
 	"reflect"
+	"context"
 
+	// TODO
 	"github.com/golang/glog"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/diff"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"metacontroller.app/apis/metacontroller/v1alpha1"
 	dynamicapply "metacontroller.app/dynamic/apply"
-	dynamicclientset "metacontroller.app/dynamic/clientset"
-	k8s "metacontroller.app/third_party/kubernetes"
 )
 
 func ApplyUpdate(orig, update *unstructured.Unstructured) (*unstructured.Unstructured, error) {
@@ -109,13 +110,15 @@ func revertField(newObj, orig *unstructured.Unstructured, fieldPath ...string) e
 }
 
 func MakeControllerRef(parent *unstructured.Unstructured) *metav1.OwnerReference {
+	ctrlTrue := true
+	blockOwnerTrue := true
 	return &metav1.OwnerReference{
 		APIVersion:         parent.GetAPIVersion(),
 		Kind:               parent.GetKind(),
 		Name:               parent.GetName(),
 		UID:                parent.GetUID(),
-		Controller:         k8s.BoolPtr(true),
-		BlockOwnerDeletion: k8s.BoolPtr(true),
+		Controller:         &ctrlTrue,
+		BlockOwnerDeletion: &blockOwnerTrue,
 	}
 }
 
@@ -123,7 +126,7 @@ type ChildUpdateStrategy interface {
 	GetMethod(apiGroup, kind string) v1alpha1.ChildUpdateMethod
 }
 
-func ManageChildren(dynClient *dynamicclientset.Clientset, updateStrategy ChildUpdateStrategy, parent *unstructured.Unstructured, observedChildren, desiredChildren ChildMap) error {
+func ManageChildren(ctx context.Context, cl client.Client, updateStrategy ChildUpdateStrategy, parent *unstructured.Unstructured, observedChildren, desiredChildren ChildMap) error {
 	// If some operations fail, keep trying others so, for example,
 	// we don't block recovery (create new Pod) on a failed delete.
 	var errs []error
@@ -131,12 +134,7 @@ func ManageChildren(dynClient *dynamicclientset.Clientset, updateStrategy ChildU
 	// Delete observed, owned objects that are not desired.
 	for key, objects := range observedChildren {
 		apiVersion, kind := ParseChildMapKey(key)
-		client, err := dynClient.Kind(apiVersion, kind)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := deleteChildren(client, parent, objects, desiredChildren[key]); err != nil {
+		if err := deleteChildren(ctx, cl, parent, objects, desiredChildren[key]); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -145,12 +143,8 @@ func ManageChildren(dynClient *dynamicclientset.Clientset, updateStrategy ChildU
 	// Create or update desired objects.
 	for key, objects := range desiredChildren {
 		apiVersion, kind := ParseChildMapKey(key)
-		client, err := dynClient.Kind(apiVersion, kind)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := updateChildren(client, updateStrategy, parent, observedChildren[key], objects); err != nil {
+		// TODO: pass these through
+		if err := updateChildren(ctx, cl, updateStrategy, parent, observedChildren[key], objects); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -159,7 +153,7 @@ func ManageChildren(dynClient *dynamicclientset.Clientset, updateStrategy ChildU
 	return utilerrors.NewAggregate(errs)
 }
 
-func deleteChildren(client *dynamicclientset.ResourceClient, parent *unstructured.Unstructured, observed, desired map[string]*unstructured.Unstructured) error {
+func deleteChildren(ctx context.Context, cl client.Client, parent *unstructured.Unstructured, observed, desired map[string]*unstructured.Unstructured) error {
 	var errs []error
 	for name, obj := range observed {
 		if obj.GetDeletionTimestamp() != nil {
@@ -172,11 +166,7 @@ func deleteChildren(client *dynamicclientset.ResourceClient, parent *unstructure
 			uid := obj.GetUID()
 			// Explicitly request deletion propagation, which is what users expect,
 			// since some objects default to orphaning for backwards compatibility.
-			propagation := metav1.DeletePropagationBackground
-			err := client.Namespace(obj.GetNamespace()).Delete(obj.GetName(), &metav1.DeleteOptions{
-				Preconditions:     &metav1.Preconditions{UID: &uid},
-				PropagationPolicy: &propagation,
-			})
+			err := cl.Delete(ctx, obj, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground))
 			if err != nil {
 				errs = append(errs, fmt.Errorf("can't delete %v: %v", describeObject(obj), err))
 				continue
@@ -186,7 +176,7 @@ func deleteChildren(client *dynamicclientset.ResourceClient, parent *unstructure
 	return utilerrors.NewAggregate(errs)
 }
 
-func updateChildren(client *dynamicclientset.ResourceClient, updateStrategy ChildUpdateStrategy, parent *unstructured.Unstructured, observed, desired map[string]*unstructured.Unstructured) error {
+func updateChildren(ctx context.Context, cl client.Client, updateStrategy ChildUpdateStrategy, parent *unstructured.Unstructured, observed, desired map[string]*unstructured.Unstructured) error {
 	var errs []error
 	for name, obj := range desired {
 		ns := obj.GetNamespace()
@@ -217,7 +207,7 @@ func updateChildren(client *dynamicclientset.ResourceClient, updateStrategy Chil
 			}
 
 			// Check the update strategy for this child kind.
-			switch method := updateStrategy.GetMethod(client.Group, client.Kind); method {
+			switch method := updateStrategy.GetMethod(/* TODO: ?? */ client.Group, client.Kind); method {
 			case v1alpha1.ChildUpdateOnDelete, "":
 				// This means we don't try to update anything unless it gets deleted
 				// by someone else (we won't delete it ourselves).
@@ -229,11 +219,7 @@ func updateChildren(client *dynamicclientset.ResourceClient, updateStrategy Chil
 				uid := oldObj.GetUID()
 				// Explicitly request deletion propagation, which is what users expect,
 				// since some objects default to orphaning for backwards compatibility.
-				propagation := metav1.DeletePropagationBackground
-				err := client.Namespace(ns).Delete(obj.GetName(), &metav1.DeleteOptions{
-					Preconditions:     &metav1.Preconditions{UID: &uid},
-					PropagationPolicy: &propagation,
-				})
+				err := cl.Delete(ctx, obj, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground))
 				if err != nil {
 					errs = append(errs, err)
 					continue
@@ -241,7 +227,7 @@ func updateChildren(client *dynamicclientset.ResourceClient, updateStrategy Chil
 			case v1alpha1.ChildUpdateInPlace, v1alpha1.ChildUpdateRollingInPlace:
 				// Update the object in-place.
 				glog.Infof("%v: updating %v", describeObject(parent), describeObject(obj))
-				if _, err := client.Namespace(ns).Update(newObj); err != nil {
+				if err := cl.Update(ctx, newObj); err != nil {
 					errs = append(errs, err)
 					continue
 				}
@@ -269,7 +255,7 @@ func updateChildren(client *dynamicclientset.ResourceClient, updateStrategy Chil
 			ownerRefs = append(ownerRefs, *controllerRef)
 			obj.SetOwnerReferences(ownerRefs)
 
-			if _, err := client.Namespace(ns).Create(obj); err != nil {
+			if err := cl.Create(ctx, obj); err != nil {
 				errs = append(errs, err)
 				continue
 			}

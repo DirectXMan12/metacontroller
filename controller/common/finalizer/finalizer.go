@@ -17,11 +17,15 @@ limitations under the License.
 package finalizer
 
 import (
+	"context"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	dynamicclientset "metacontroller.app/dynamic/clientset"
 	dynamicobject "metacontroller.app/dynamic/object"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Manager encapsulates controller logic for dealing with finalizers.
@@ -30,23 +34,29 @@ type Manager struct {
 	Enabled bool
 }
 
+// TODO: switch to add/remove finalizer from CR when those merge
+
 // SyncObject adds or removes the finalizer on the given object as necessary.
-func (m *Manager) SyncObject(client *dynamicclientset.ResourceClient, obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+func (m *Manager) SyncObject(ctx context.Context, cl client.Client, obj *unstructured.Unstructured) error {
 	// If the cached object passed in is already in the right state,
 	// we'll assume we don't need to check the live object.
 	if dynamicobject.HasFinalizer(obj, m.Name) == m.Enabled {
-		return obj, nil
+		return nil
 	}
 	// Otherwise, we may need to update the object.
 	if m.Enabled {
 		// If the object is already pending deletion, we don't add the finalizer.
 		// We might have already removed it.
 		if obj.GetDeletionTimestamp() != nil {
-			return obj, nil
+			return nil
 		}
-		return client.Namespace(obj.GetNamespace()).AddFinalizer(obj, m.Name)
+
+		// TODO: this used to repeatedly loop till it added the finalizer succesfully -- restore that behavior
+		dynamicobject.AddFinalizer(obj, m.Name)
+		return cl.Update(ctx, obj)
 	} else {
-		return client.Namespace(obj.GetNamespace()).RemoveFinalizer(obj, m.Name)
+		dynamicobject.RemoveFinalizer(obj, m.Name)
+		return cl.Update(ctx, obj)
 	}
 }
 

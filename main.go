@@ -25,12 +25,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/golang/glog"
 	"go.opencensus.io/exporter/prometheus"
 	"go.opencensus.io/stats/view"
 
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"metacontroller.app/server"
 
@@ -38,40 +39,32 @@ import (
 )
 
 var (
-	discoveryInterval = flag.Duration("discovery-interval", 30*time.Second, "How often to refresh discovery cache to pick up newly-installed resources")
-	informerRelist    = flag.Duration("cache-flush-interval", 30*time.Minute, "How often to flush local caches and relist objects from the API server")
 	debugAddr         = flag.String("debug-addr", ":9999", "The address to bind the debug http endpoints")
-	clientConfigPath  = flag.String("client-config-path", "", "Path to kubeconfig file (same format as used by kubectl); if not specified, use in-cluster config")
+	// TODO: client-config-path is different from --kubeconfig
+	informerRelist    = flag.Duration("cache-flush-interval", 30*time.Minute, "How often to flush local caches and relist objects from the API server")
+	// TODO: ^ we shouldn't do this
 )
 
 func main() {
 	flag.Parse()
+	ctrl.SetLogger(zap.Logger(true))
 
-	glog.Infof("Discovery cache flush interval: %v", *discoveryInterval)
-	glog.Infof("API server object cache flush interval: %v", *informerRelist)
-	glog.Infof("Debug http server address: %v", *debugAddr)
+	setupLog := ctrl.Log.WithName("setup")
 
-	var config *rest.Config
-	var err error
-	if *clientConfigPath != "" {
-		glog.Infof("Using current context from kubeconfig file: %v", *clientConfigPath)
-		config, err = clientcmd.BuildConfigFromFlags("", *clientConfigPath)
-	} else {
-		glog.Info("No kubeconfig file specified; trying in-cluster auto-config...")
-		config, err = rest.InClusterConfig()
-	}
-	if err != nil {
-		glog.Fatal(err)
-	}
+	setupLog.Info("debug http server address", "address", *debugAddr)
 
-	stopServer, err := server.Start(config, *discoveryInterval, *informerRelist)
-	if err != nil {
-		glog.Fatal(err)
-	}
+	config := ctrl.GetConfigOrDie()
+
+	// TODO: opencensus support
+	// TODO: relisting discovery client
+	mgr := ctrl.NewManager(config, ctrl.Options{
+		RelistInterval: informerRelist,
+	})
 
 	exporter, err := prometheus.NewExporter(prometheus.Options{})
 	if err != nil {
-		glog.Fatalf("can't create prometheus exporter: %v", err)
+		setupLog.Error(err, "unable to set up prometheus exporter")
+		os.Exit(1)
 	}
 	view.RegisterExporter(exporter)
 
@@ -82,14 +75,16 @@ func main() {
 		Handler: mux,
 	}
 	go func() {
-		glog.Errorf("Error serving debug endpoint: %v", srv.ListenAndServe())
+		if err := srv.ListenAndServe(); err != nil {
+			setupLog.Error(err, "unable to serve debug endpoint")
+		}
 	}()
 
 	// On SIGTERM, stop all controllers gracefully.
-	sigchan := make(chan os.Signal, 2)
-	signal.Notify(sigchan, os.Interrupt, syscall.SIGTERM)
-	sig := <-sigchan
-	glog.Infof("Received %q signal. Shutting down...", sig)
+	stopChan := ctrl.SetupSignalHandlers()
+
+	<-sigchan
+	setupLog.Info("Received stop signal. Shutting down...")
 
 	stopServer()
 	srv.Shutdown(context.Background())

@@ -17,175 +17,75 @@ limitations under the License.
 package decorator
 
 import (
-	"fmt"
-	"sync"
-
-	"github.com/golang/glog"
+	"context"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"github.com/go-logr/logr"
 
 	"metacontroller.app/apis/metacontroller/v1alpha1"
-	mcinformers "metacontroller.app/client/generated/informer/externalversions"
-	mclisters "metacontroller.app/client/generated/lister/metacontroller/v1alpha1"
-	"metacontroller.app/controller/common"
-	dynamicclientset "metacontroller.app/dynamic/clientset"
-	dynamicdiscovery "metacontroller.app/dynamic/discovery"
-	dynamicinformer "metacontroller.app/dynamic/informer"
-	k8s "metacontroller.app/third_party/kubernetes"
 )
 
 type Metacontroller struct {
-	resources    *dynamicdiscovery.ResourceMap
-	dynClient    *dynamicclientset.Clientset
-	dynInformers *dynamicinformer.SharedInformerFactory
+	client.Client
+	log logr.Logger
 
-	dcLister   mclisters.DecoratorControllerLister
-	dcInformer cache.SharedIndexInformer
-
-	queue                workqueue.RateLimitingInterface
 	decoratorControllers map[string]*decoratorController
 
-	stopCh, doneCh chan struct{}
+	mgr ctrl.Manager
 }
 
-func NewMetacontroller(resources *dynamicdiscovery.ResourceMap, dynClient *dynamicclientset.Clientset, dynInformers *dynamicinformer.SharedInformerFactory, mcInformerFactory mcinformers.SharedInformerFactory) *Metacontroller {
-	mc := &Metacontroller{
-		resources:    resources,
-		dynClient:    dynClient,
-		dynInformers: dynInformers,
+func (mc *Metacontroller) SetupWithManager(mgr ctrl.Manager) error {
+	mc.decoratorControllers = make(map[string]*decoratorController)
+	mc.mgr = mgr
 
-		dcLister:   mcInformerFactory.Metacontroller().V1alpha1().DecoratorControllers().Lister(),
-		dcInformer: mcInformerFactory.Metacontroller().V1alpha1().DecoratorControllers().Informer(),
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&v1alpha1.DecoratorController{}).
+		Complete(mc)
+}
 
-		queue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DecoratorController"),
-		decoratorControllers: make(map[string]*decoratorController),
+// TODO: stop all child controllers
+
+func (mc *Metacontroller) Reconcile(req ctrl.Request) (ctrl.Result, error) {
+	ctx := context.Background()
+	log := mc.log.WithValues("decoratorcontroller", req)
+
+	// load the controller, and stop it if it was deleted, and is still running
+	var contCfg v1alpha1.DecoratorController
+	if err := mc.Get(ctx, req.NamespacedName, &contCfg); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			log.V(1).Info("decorator controller has been deleted")
+			if cont, ok := mc.decoratorControllers[req.Name]; ok {
+				cont.Stop()
+				delete(mc.decoratorControllers, req.Name)
+			}
+			return ctrl.Result{}, nil
+		}
+		log.Error(err, "unable to fetch controller")
+		return ctrl.Result{}, err
 	}
 
-	mc.dcInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    mc.enqueueDecoratorController,
-		UpdateFunc: mc.updateDecoratorController,
-		DeleteFunc: mc.enqueueDecoratorController,
-	})
-
-	return mc
-}
-
-func (mc *Metacontroller) Start() {
-	mc.stopCh = make(chan struct{})
-	mc.doneCh = make(chan struct{})
-
-	go func() {
-		defer close(mc.doneCh)
-		defer utilruntime.HandleCrash()
-
-		glog.Info("Starting DecoratorController metacontroller")
-		defer glog.Info("Shutting down DecoratorController metacontroller")
-
-		if !k8s.WaitForCacheSync("DecoratorController", mc.stopCh, mc.dcInformer.HasSynced) {
-			return
+	// check if we need to stop the controller to recreate it because it changed configuration
+	if cont, alreadyStarted := mc.decoratorControllers[req.Name]; alreadyStarted {
+		if apiequality.Semantic.DeepEqual(contCfg.Spec, cont.dc.Spec) {
+			// nothing changed
+			return ctrl.Result{}, nil
 		}
 
-		// In the metacontroller, we are only responsible for starting/stopping
-		// the actual controllers, so a single worker should be enough.
-		for mc.processNextWorkItem() {
-		}
-	}()
-}
+		// TODO: we've got no good way to stop these but still share caches
 
-func (mc *Metacontroller) Stop() {
-	// Stop metacontroller first so there's no more changes to controllers.
-	close(mc.stopCh)
-	mc.queue.ShutDown()
-	<-mc.doneCh
-
-	// Stop all controllers.
-	var wg sync.WaitGroup
-	for _, c := range mc.decoratorControllers {
-		wg.Add(1)
-		go func(c *decoratorController) {
-			defer wg.Done()
-			c.Stop()
-		}(c)
+		// otherwise, stop the controller and recreate it with the new settings
+		cont.Stop()
+		delete(mc.decoratorControllers, req.Name)
 	}
-	wg.Wait()
-}
 
-func (mc *Metacontroller) processNextWorkItem() bool {
-	key, quit := mc.queue.Get()
-	if quit {
-		return false
-	}
-	defer mc.queue.Done(key)
-
-	err := mc.sync(key.(string))
+	// (re)create the controller
+	err := newDecoratorControllers(mc.mgr, contCfg)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("failed to sync DecoratorController %q: %v", key, err))
-		mc.queue.AddRateLimited(key)
-		return true
+		log.Error(err, "unable to create the controller from the config")
+		return ctrl.Result{}, err
 	}
-
-	mc.queue.Forget(key)
-	return true
-}
-
-func (mc *Metacontroller) sync(key string) error {
-	_, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return err
-	}
-
-	glog.V(4).Infof("sync DecoratorController %v", name)
-
-	dc, err := mc.dcLister.Get(name)
-	if apierrors.IsNotFound(err) {
-		glog.V(4).Infof("DecoratorController %v has been deleted", name)
-		// Stop and remove the controller if it exists.
-		if c, ok := mc.decoratorControllers[name]; ok {
-			c.Stop()
-			delete(mc.decoratorControllers, name)
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return mc.syncDecoratorController(dc)
-}
-
-func (mc *Metacontroller) syncDecoratorController(dc *v1alpha1.DecoratorController) error {
-	if c, ok := mc.decoratorControllers[dc.Name]; ok {
-		// The controller was already started.
-		if apiequality.Semantic.DeepEqual(dc.Spec, c.dc.Spec) {
-			// Nothing has changed.
-			return nil
-		}
-		// Stop and remove the controller so it can be recreated.
-		c.Stop()
-		delete(mc.decoratorControllers, dc.Name)
-	}
-
-	c, err := newDecoratorController(mc.resources, mc.dynClient, mc.dynInformers, dc)
-	if err != nil {
-		return err
-	}
-	c.Start()
-	mc.decoratorControllers[dc.Name] = c
-	return nil
-}
-
-func (mc *Metacontroller) enqueueDecoratorController(obj interface{}) {
-	key, err := common.KeyFunc(obj)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
-		return
-	}
-	mc.queue.Add(key)
-}
-
-func (mc *Metacontroller) updateDecoratorController(old, cur interface{}) {
-	mc.enqueueDecoratorController(cur)
+	mc.decoratorControllers[req.Name] = conts
+	return ctrl.Result{}, nil
 }

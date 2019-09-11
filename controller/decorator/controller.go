@@ -62,6 +62,7 @@ type decoratorController struct {
 	childIndex string
 }
 
+// TODO: move to common
 func resourceToGVK(apiVer, res string, mapper apimeta.RESTMapper) (schema.GroupVersionKind, error) {
 	groupVer, err := schema.ParseGroupVersion(apiVer)
 	if err != nil {
@@ -287,7 +288,7 @@ func (c *decoratorController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 	}
 
-	return ctrl.Result{}, manageErr
+	return res, manageErr
 }
 
 func (c *decoratorController) getChildren(ctx context.Context, parent *unstructured.Unstructured) (common.ChildMap, error) {
@@ -298,8 +299,15 @@ func (c *decoratorController) getChildren(ctx context.Context, parent *unstructu
 		// List all objects of the child kind in the parent object's namespace,
 		// or in all namespaces if the parent is cluster-scoped.
 
+		gvk, err := resourceToGVK(child.APIVersion, child.Resource, c.resources)
+		if err != nil {
+			return nil, fmt.Errorf("can't find resource %q in apiVersion %q: %v", child.Resource, child.APIVersion, err)
+		}
+
+		// TODO: need to set the GVK
 		var all unstructured.UnstructuredList
-		var err error
+		all.SetAPIVersion(child.APIVersion)
+		all.SetKind(gvk.Kind+"List")
 		if parentNamespace != "" {
 			// childIndex is "belong to parent for this decorator (via decorator annotation)
 			err = c.List(ctx, &all, client.InNamespace(parentNamespace), client.MatchingField(c.childIndex, parent.GetName()))
@@ -310,11 +318,6 @@ func (c *decoratorController) getChildren(ctx context.Context, parent *unstructu
 			return nil, fmt.Errorf("can't list children for resource %q in apiVersion %q: %v", child.Resource, child.APIVersion, err)
 		}
 
-		// Always include the requested groups, even if there are no entries.
-		gvk, err := resourceToGVK(child.APIVersion, child.Resource, c.resources)
-		if err != nil {
-			return nil, fmt.Errorf("can't find resource %q in apiVersion %q: %v", child.Resource, child.APIVersion, err)
-		}
 		childMap.InitGroup(child.APIVersion, gvk.Kind)
 
 		// Take only the objects that belong to this parent,

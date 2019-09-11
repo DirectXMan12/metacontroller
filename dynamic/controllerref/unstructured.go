@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dynamicclientset "metacontroller.app/dynamic/clientset"
 	k8s "metacontroller.app/third_party/kubernetes"
@@ -36,10 +37,10 @@ type UnstructuredManager struct {
 	k8s.BaseControllerRefManager
 	parentKind schema.GroupVersionKind
 	childKind  schema.GroupVersionKind
-	client     *dynamicclientset.ResourceClient
+	client     client.Client
 }
 
-func NewUnstructuredManager(client *dynamicclientset.ResourceClient, parent metav1.Object, selector labels.Selector, parentKind, childKind schema.GroupVersionKind, canAdopt func() error) *UnstructuredManager {
+func NewUnstructuredManager(cl client.Client, parent metav1.Object, selector labels.Selector, parentKind, childKind schema.GroupVersionKind, canAdopt func() error) *UnstructuredManager {
 	return &UnstructuredManager{
 		BaseControllerRefManager: k8s.BaseControllerRefManager{
 			Controller:   parent,
@@ -48,11 +49,11 @@ func NewUnstructuredManager(client *dynamicclientset.ResourceClient, parent meta
 		},
 		parentKind: parentKind,
 		childKind:  childKind,
-		client:     client,
+		client:     cl,
 	}
 }
 
-func (m *UnstructuredManager) ClaimChildren(children []*unstructured.Unstructured) ([]*unstructured.Unstructured, error) {
+func (m *UnstructuredManager) ClaimChildren(children []unstructured.Unstructured) ([]*unstructured.Unstructured, error) {
 	var claimed []*unstructured.Unstructured
 	var errlist []error
 
@@ -67,13 +68,13 @@ func (m *UnstructuredManager) ClaimChildren(children []*unstructured.Unstructure
 	}
 
 	for _, child := range children {
-		ok, err := m.ClaimObject(child, match, adopt, release)
+		ok, err := m.ClaimObject(&child, match, adopt, release)
 		if err != nil {
 			errlist = append(errlist, err)
 			continue
 		}
 		if ok {
-			claimed = append(claimed, child)
+			claimed = append(claimed, &child)
 		}
 	}
 	return claimed, utilerrors.NewAggregate(errlist)

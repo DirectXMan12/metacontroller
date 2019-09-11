@@ -22,6 +22,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"metacontroller.app/controller/common"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 
 	"metacontroller.app/apis/metacontroller/v1alpha1"
 	dynamicdiscovery "metacontroller.app/dynamic/discovery"
@@ -323,18 +324,17 @@ func isRollingStrategy(strategy *v1alpha1.CompositeControllerChildUpdateStrategy
 	return false
 }
 
-func makeUpdateStrategyMap(resources *dynamicdiscovery.ResourceMap, cc *v1alpha1.CompositeController) (updateStrategyMap, error) {
+func makeUpdateStrategyMap(resources apimeta.RESTMapper, cc *v1alpha1.CompositeController) (updateStrategyMap, error) {
 	m := make(updateStrategyMap)
 	for _, child := range cc.Spec.ChildResources {
 		if child.UpdateStrategy != nil && child.UpdateStrategy.Method != v1alpha1.ChildUpdateOnDelete {
 			// Map resource name to kind name.
-			resource := resources.Get(child.APIVersion, child.Resource)
-			if resource == nil {
-				return nil, fmt.Errorf("can't find child resource %q in %v", child.Resource, child.APIVersion)
+			gvk, err := resourceToGVK(child.APIVersion, child.Resource, resources)
+			if err != nil {
+				return nil, fmt.Errorf("can't find child resource %q in %v: %v", child.Resource, child.APIVersion, err)
 			}
 			// Ignore API version.
-			apiGroup, _ := common.ParseAPIVersion(child.APIVersion)
-			key := claimMapKey(apiGroup, resource.Kind)
+			key := claimMapKey(gvk.Group, gvk.Kind)
 			m[key] = child.UpdateStrategy
 		}
 	}

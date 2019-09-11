@@ -22,14 +22,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/client-go/tools/cache"
-
-	dynamicdiscovery "metacontroller.app/dynamic/discovery"
-	dynamicinformer "metacontroller.app/dynamic/informer"
-)
-
-var (
-	KeyFunc = cache.DeletionHandlingMetaNamespaceKeyFunc
 )
 
 type ChildMap map[string]map[string]*unstructured.Unstructured
@@ -148,6 +140,7 @@ func ParseChildMapKey(key string) (apiVersion, kind string) {
 	return parts[1], parts[0]
 }
 
+// TODO: this is just schema.ParseAPIVersion
 func ParseAPIVersion(apiVersion string) (group, version string) {
 	parts := strings.SplitN(apiVersion, "/", 2)
 	if len(parts) == 1 {
@@ -155,32 +148,4 @@ func ParseAPIVersion(apiVersion string) (group, version string) {
 		return "", parts[0]
 	}
 	return parts[0], parts[1]
-}
-
-type GroupKindMap map[string]*dynamicdiscovery.APIResource
-
-func (m GroupKindMap) Set(apiGroup, kind string, resource *dynamicdiscovery.APIResource) {
-	m[groupKindKey(apiGroup, kind)] = resource
-}
-
-func (m GroupKindMap) Get(apiGroup, kind string) *dynamicdiscovery.APIResource {
-	return m[groupKindKey(apiGroup, kind)]
-}
-
-func groupKindKey(apiGroup, kind string) string {
-	return fmt.Sprintf("%s.%s", kind, apiGroup)
-}
-
-type InformerMap map[string]*dynamicinformer.ResourceInformer
-
-func (m InformerMap) Set(apiVersion, resource string, informer *dynamicinformer.ResourceInformer) {
-	m[informerMapKey(apiVersion, resource)] = informer
-}
-
-func (m InformerMap) Get(apiVersion, resource string) *dynamicinformer.ResourceInformer {
-	return m[informerMapKey(apiVersion, resource)]
-}
-
-func informerMapKey(apiVersion, resource string) string {
-	return fmt.Sprintf("%s.%s", resource, apiVersion)
 }
